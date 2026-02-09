@@ -9,6 +9,12 @@ Ein schlanker Service, der die **WatchYourLAN API** regelmäßig abfragt und bei
 
 > ✅ Beim ersten Start wird nur initialisiert (State aufbauen) – **keine Benachrichtigungen**, damit es keinen Alert-Sturm gibt.
 
+<details>
+  <summary>📸 Screenshot (Beispiel)</summary>
+
+  ![Teams Alert Example](https://i.imgur.com/cRddQ3h.png)
+</details>
+
 ---
 
 ## ✨ Features
