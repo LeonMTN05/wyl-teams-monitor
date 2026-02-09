@@ -1,0 +1,217 @@
+version: "3.8"
+
+services:
+  wyl-teams-monitor:
+    image: python:3.12-slim
+    container_name: wyl-teams-monitor
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Berlin
+      WYL_API_URL: "http://YOUR_WYL_IP:8840/api/all"
+      TEAMS_WEBHOOK_URL: "YOUR_TEAMS_WEBHOOK_URL"
+
+      POLL_INTERVAL: "15"
+      HTTP_TIMEOUT: "10"
+
+      # Nur Geräte mit Known=1 überwachen
+      TRACK_KNOWN_ONLY: "true"
+
+      # Falls ein Gerät aus der API mal kurz "verschwindet": erst nach X Polls als offline werten
+      OFFLINE_IF_MISSING_AFTER: "3"
+
+      DEBUG: "true"
+      STATE_PATH: "/data/state.json"
+    volumes:
+      - wyl-teams-monitor-data:/data
+    command:
+      - /bin/sh
+      - -c
+      - |
+          pip install --no-cache-dir requests >/dev/null 2>&1
+          cat > /app.py <<'PY'
+          import os, time, json
+          import requests
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          def env_int(name, default):
+              try: return int(os.getenv(name, str(default)).strip())
+              except: return default
+
+          def env_bool(name, default=False):
+              v = os.getenv(name, "")
+              if v == "": return default
+              return v.strip().lower() in ("1","true","yes","y","on")
+
+          TZ = ZoneInfo(os.getenv("TZ","Europe/Berlin"))
+          WYL_API_URL = os.environ["WYL_API_URL"]
+          TEAMS_WEBHOOK_URL = os.environ["TEAMS_WEBHOOK_URL"]
+          POLL_INTERVAL = env_int("POLL_INTERVAL", 15)
+          HTTP_TIMEOUT = env_int("HTTP_TIMEOUT", 10)
+          STATE_PATH = os.getenv("STATE_PATH","/data/state.json")
+          OFFLINE_IF_MISSING_AFTER = env_int("OFFLINE_IF_MISSING_AFTER", 3)
+          TRACK_KNOWN_ONLY = env_bool("TRACK_KNOWN_ONLY", True)
+          DEBUG = env_bool("DEBUG", False)
+
+          def now_str():
+              return datetime.now(TZ).strftime("%d.%m.%Y %H:%M:%S %Z")
+
+          def load_state():
+              try:
+                  with open(STATE_PATH,"r",encoding="utf-8") as f:
+                      return json.load(f)
+              except:
+                  return {"devices": {}}
+
+          def save_state(state):
+              tmp = STATE_PATH + ".tmp"
+              with open(tmp,"w",encoding="utf-8") as f:
+                  json.dump(state, f, ensure_ascii=False, indent=2)
+              os.replace(tmp, STATE_PATH)
+
+          def send_teams(status, dev):
+              is_online = (status == "online")
+              name = dev.get("Name") or "-"
+              hw = dev.get("Hw") or "-"
+              mac = (dev.get("Mac") or "-").upper()
+              ip = dev.get("IP") or "-"
+              wyl_date = dev.get("Date") or "-"
+
+              payload = {
+                  "@type":"MessageCard",
+                  "@context":"http://schema.org/extensions",
+                  "summary": f"WatchYourLAN: {name} {status}",
+                  "themeColor": "2ECC71" if is_online else "E74C3C",
+                  "title": ("🟢 Gerät ONLINE" if is_online else "🔴 Gerät OFFLINE"),
+                  "sections": [{
+                      "markdown": True,
+                      "activityTitle": f"**{name}** ist {'wieder online' if is_online else 'offline'}",
+                      "facts": [
+                          {"name":"Hostname", "value": name},
+                          {"name":"Hersteller", "value": hw},
+                          {"name":"MAC", "value": mac},
+                          {"name":"IP", "value": ip},
+                          {"name":"Uhrzeit", "value": now_str()},
+                          {"name":"WYL Last Seen", "value": wyl_date},
+                      ]
+                  }]
+              }
+
+              r = requests.post(TEAMS_WEBHOOK_URL, json=payload, timeout=HTTP_TIMEOUT)
+              if r.status_code >= 300:
+                  raise RuntimeError(f"Teams webhook HTTP {r.status_code}: {r.text[:300]}")
+
+          print(f"[wyl-teams-monitor] Start. Poll={POLL_INTERVAL}s API={WYL_API_URL} track_known_only={TRACK_KNOWN_ONLY}")
+
+          state = load_state()
+          devices = state.get("devices", {})
+          initialized = bool(devices)  # wenn leer: erster Durchlauf wird nur “gemerkt”, nicht benachrichtigt
+
+          while True:
+              t0 = time.time()
+              try:
+                  resp = requests.get(WYL_API_URL, timeout=HTTP_TIMEOUT)
+                  resp.raise_for_status()
+                  hosts = resp.json()
+                  if not isinstance(hosts, list):
+                      raise RuntimeError(f"API returned {type(hosts)} instead of list")
+
+                  # Filter: Known=1
+                  tracked = []
+                  for h in hosts:
+                      if not isinstance(h, dict):
+                          continue
+                      if TRACK_KNOWN_ONLY and int(h.get("Known", 0) or 0) != 1:
+                          continue
+                      mac = (h.get("Mac") or "").lower().strip()
+                      if not mac:
+                          continue
+                      tracked.append(h)
+
+                  current = {}
+                  for h in tracked:
+                      mac = (h.get("Mac") or "").lower().strip()
+                      now = int(h.get("Now", 0) or 0)  # 1=online, 0=offline
+                      current[mac] = {
+                          "Mac": h.get("Mac"),
+                          "IP": h.get("IP"),
+                          "Name": h.get("Name"),
+                          "Hw": h.get("Hw"),
+                          "Date": h.get("Date"),
+                          "Now": now,
+                          "Known": h.get("Known", 0),
+                      }
+
+                  if DEBUG:
+                      online_cnt = sum(1 for d in current.values() if int(d.get("Now",0)) == 1)
+                      print(f"[poll] total_hosts={len(hosts)} tracked_known={len(current)} online={online_cnt} offline={len(current)-online_cnt} initialized={initialized}")
+
+                  # Update + detect transitions
+                  for mac, dev in current.items():
+                      prev = devices.get(mac)
+                      if not prev:
+                          devices[mac] = {
+                              "Now": int(dev["Now"]),
+                              "missing": 0,
+                              "Name": dev.get("Name"),
+                              "Hw": dev.get("Hw"),
+                              "IP": dev.get("IP"),
+                              "Date": dev.get("Date"),
+                          }
+                          continue
+
+                      prev_now = int(prev.get("Now", 0) or 0)
+                      new_now = int(dev.get("Now", 0) or 0)
+
+                      # update info
+                      prev["missing"] = 0
+                      prev["Name"] = dev.get("Name")
+                      prev["Hw"] = dev.get("Hw")
+                      prev["IP"] = dev.get("IP")
+                      prev["Date"] = dev.get("Date")
+
+                      if initialized and prev_now != new_now:
+                          status = "online" if new_now == 1 else "offline"
+                          try:
+                              send_teams(status, dev)
+                              print(f"[notify] {dev.get('Mac')} -> {status} ({dev.get('Name')}, {dev.get('IP')})")
+                          except Exception as e:
+                              print(f"[error] sending Teams failed: {e}")
+
+                      prev["Now"] = new_now
+
+                  # Missing handling (falls API mal “schwankt”)
+                  for mac, prev in list(devices.items()):
+                      if mac not in current:
+                          prev["missing"] = int(prev.get("missing", 0)) + 1
+                          if initialized and int(prev.get("Now",0)) == 1 and prev["missing"] >= OFFLINE_IF_MISSING_AFTER:
+                              prev["Now"] = 0
+                              ghost = {
+                                  "Mac": mac,
+                                  "IP": prev.get("IP"),
+                                  "Name": prev.get("Name"),
+                                  "Hw": prev.get("Hw"),
+                                  "Date": prev.get("Date"),
+                                  "Now": 0,
+                              }
+                              try:
+                                  send_teams("offline", ghost)
+                                  print(f"[notify] {mac} -> offline (missing {prev['missing']} polls)")
+                              except Exception as e:
+                                  print(f"[error] sending Teams failed: {e}")
+
+                  state["devices"] = devices
+                  save_state(state)
+                  initialized = True
+
+              except Exception as e:
+                  print(f"[error] poll failed: {e}")
+
+              # sleep
+              elapsed = time.time() - t0
+              time.sleep(max(1, POLL_INTERVAL - int(elapsed)))
+          PY
+          python -u /app.py
+
+volumes:
+  wyl-teams-monitor-data:
